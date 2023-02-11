@@ -206,6 +206,9 @@ func benchmarkParse(b *testing.B, s string) {
 	b.Run("fastjson-get", func(b *testing.B) {
 		benchmarkFastJSONParseGet(b, s)
 	})
+	b.Run("fastjson-visit", func(b *testing.B) {
+		benchmarkFastJSONParseVisit(b, s)
+	})
 }
 
 func benchmarkFastJSONParse(b *testing.B, s string) {
@@ -260,6 +263,50 @@ func benchmarkFastJSONParseGet(b *testing.B, s string) {
 				n++
 			}
 		}
+		benchPool.Put(p)
+	})
+}
+
+func benchmarkFastJSONParseVisit(b *testing.B, s string) {
+	b.ReportAllocs()
+	b.SetBytes(int64(len(s)))
+	b.RunParallel(func(pb *testing.PB) {
+		p := benchPool.Get()
+		p.Visit = func(val *Value, path []string) error {
+			return nil
+		}
+
+		var n int
+		for pb.Next() {
+			v, err := p.Parse(s)
+			if err != nil {
+				panic(fmt.Errorf("unexpected error: %s", err))
+			}
+			n += v.GetInt("sid")
+			n += len(v.GetStringBytes("uuid"))
+			p := v.Get("person")
+			if p != nil {
+				n++
+			}
+			c := v.Get("company")
+			if c != nil {
+				n++
+			}
+			u := v.Get("users")
+			if u != nil {
+				n++
+			}
+			a := v.GetArray("features")
+			n += len(a)
+			a = v.GetArray("topicSubTopics")
+			n += len(a)
+			o := v.Get("search_metadata")
+			if o != nil {
+				n++
+			}
+		}
+
+		p.Visit = nil
 		benchPool.Put(p)
 	})
 }

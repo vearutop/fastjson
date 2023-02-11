@@ -15,12 +15,19 @@ import (
 // Parser cannot be used from concurrent goroutines.
 // Use per-goroutine parsers or ParserPool instead.
 type Parser struct {
+	// Visit is a callback that receives values as soon as they are available and can stop further parsing.
+	Visit func(val *Value, path []string) error
+
 	// b contains working copy of the string to be parsed.
 	b []byte
 
 	// c is a cache for json values.
 	c cache
+
+	p []string
 }
+
+type visit func(v *Value, k []string) error
 
 // Parse parses s containing JSON.
 //
@@ -32,7 +39,19 @@ func (p *Parser) Parse(s string) (*Value, error) {
 	p.b = append(p.b[:0], s...)
 	p.c.reset()
 
-	v, tail, err := parseValue(b2s(p.b), &p.c, 0)
+	var (
+		vis  visit
+		path []string
+	)
+	if p.Visit != nil {
+		vis = p.Visit
+		if p.p == nil {
+			p.p = make([]string, 0, 300)
+		}
+		path = p.p[:0]
+	}
+
+	v, tail, err := parseValue(b2s(p.b), &p.c, 0, vis, path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
 	}
@@ -98,7 +117,7 @@ type kv struct {
 // MaxDepth is the maximum depth for nested JSON.
 const MaxDepth = 300
 
-func parseValue(s string, c *cache, depth int) (*Value, string, error) {
+func parseValue(s string, c *cache, depth int, vis visit, path []string) (v *Value, tail string, err error) {
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("cannot parse empty string")
 	}
@@ -107,15 +126,26 @@ func parseValue(s string, c *cache, depth int) (*Value, string, error) {
 		return nil, s, fmt.Errorf("too big depth for the nested JSON; it exceeds %d", MaxDepth)
 	}
 
+	if vis != nil {
+		defer func() {
+			if err != nil {
+				if verr := vis(v, path); verr != nil {
+					v = nil
+					err = verr
+				}
+			}
+		}()
+	}
+
 	if s[0] == '{' {
-		v, tail, err := parseObject(s[1:], c, depth)
+		v, tail, err := parseObject(s[1:], c, depth, vis, path)
 		if err != nil {
 			return nil, tail, fmt.Errorf("cannot parse object: %s", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '[' {
-		v, tail, err := parseArray(s[1:], c, depth)
+		v, tail, err := parseArray(s[1:], c, depth, vis, path)
 		if err != nil {
 			return nil, tail, fmt.Errorf("cannot parse array: %s", err)
 		}
@@ -135,13 +165,15 @@ func parseValue(s string, c *cache, depth int) (*Value, string, error) {
 		if len(s) < len("true") || s[:len("true")] != "true" {
 			return nil, s, fmt.Errorf("unexpected value found: %q", s)
 		}
-		return valueTrue, s[len("true"):], nil
+		tail := s[len("true"):]
+		return valueTrue, tail, nil
 	}
 	if s[0] == 'f' {
 		if len(s) < len("false") || s[:len("false")] != "false" {
 			return nil, s, fmt.Errorf("unexpected value found: %q", s)
 		}
-		return valueFalse, s[len("false"):], nil
+		tail := s[len("false"):]
+		return valueFalse, tail, nil
 	}
 	if s[0] == 'n' {
 		if len(s) < len("null") || s[:len("null")] != "null" {
@@ -161,13 +193,13 @@ func parseValue(s string, c *cache, depth int) (*Value, string, error) {
 	if err != nil {
 		return nil, tail, fmt.Errorf("cannot parse number: %s", err)
 	}
-	v := c.getValue()
+	v = c.getValue()
 	v.t = TypeNumber
 	v.s = ns
 	return v, tail, nil
 }
 
-func parseArray(s string, c *cache, depth int) (*Value, string, error) {
+func parseArray(s string, c *cache, depth int, vis visit, path []string) (*Value, string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("missing ']'")
@@ -183,16 +215,22 @@ func parseArray(s string, c *cache, depth int) (*Value, string, error) {
 	a := c.getValue()
 	a.t = TypeArray
 	a.a = a.a[:0]
+	i := 0
 	for {
 		var v *Value
 		var err error
 
+		if vis != nil {
+			path = append(path, strconv.Itoa(i))
+		}
+
 		s = skipWS(s)
-		v, s, err = parseValue(s, c, depth)
+		v, s, err = parseValue(s, c, depth, vis, path)
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse array value: %s", err)
 		}
 		a.a = append(a.a, v)
+		i++
 
 		s = skipWS(s)
 		if len(s) == 0 {
@@ -210,7 +248,7 @@ func parseArray(s string, c *cache, depth int) (*Value, string, error) {
 	}
 }
 
-func parseObject(s string, c *cache, depth int) (*Value, string, error) {
+func parseObject(s string, c *cache, depth int, vis visit, path []string) (*Value, string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("missing '}'")
@@ -247,7 +285,12 @@ func parseObject(s string, c *cache, depth int) (*Value, string, error) {
 
 		// Parse value
 		s = skipWS(s)
-		kv.v, s, err = parseValue(s, c, depth)
+
+		if vis != nil {
+			path = append(path, kv.k)
+		}
+
+		kv.v, s, err = parseValue(s, c, depth, vis, path)
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse object value: %s", err)
 		}
